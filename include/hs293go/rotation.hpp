@@ -166,8 +166,14 @@ Eigen::Matrix3<typename Derived::Scalar> AngleAxisToRotationMatrix(
   }
   const Scalar cos_theta = cos(theta);
   const Scalar sin_theta = sin(theta);
+  // Pre-normalize the axis because the alternative is writing angle_axis *
+  // angle_axis.transpose() / (theta * theta), leading to potentially
+  // catastrophic cancellation in the denominator when theta is small.
   const Eigen::Vector3<Scalar> axis = angle_axis / theta;
 
+  // Compared to the I + sin*hat + (1-cos)*hat^2 form, this form is
+  // computationally cheaper because it avoids the extra matrix-matrix multiply
+  // (hat^2)
   return cos_theta * Eigen::Matrix3<Scalar>::Identity() +
          (Scalar(1) - cos_theta) * axis * axis.transpose() +
          sin_theta * hat(axis);
