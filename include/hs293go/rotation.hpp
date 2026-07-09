@@ -93,6 +93,13 @@ Eigen::Matrix3<typename Derived::Scalar> hat(
                                 {-v[1], v[0], Scalar(0)}};
 }
 
+template <typename Derived>
+Eigen::Vector3<typename Derived::Scalar> vee(
+    const Eigen::MatrixBase<Derived>& m) {
+  using Scalar = typename Derived::Scalar;
+  return {m(2, 1), m(0, 2), m(1, 0)};
+}
+
 // SO(3) logarithm of a unit quaternion: the rotation vector theta * axis,
 // whose magnitude is the true rotation angle (wrapped to (-pi, pi]). This is
 // Ceres's QuaternionToAngleAxis. Unlike 2 * vec(q) = 2 sin(theta/2) * axis,

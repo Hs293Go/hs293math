@@ -39,8 +39,10 @@ This library currently contains 4 files, shown below.
   - `deg2rad`: Convert degrees to radians (Matlab builtin)
 - `rotation.hpp`: Contains functions for converting between rotation
   representations
-  - Most of these functions are Eigen reimplementations of Ceres's
+  - Many of these functions are Eigen reimplementations of Ceres's
     [`rotation.h`](https://github.com/ceres-solver/ceres-solver/blob/master/include/ceres/rotation.h)
+  - `hat`: Convert a 3D vector to a skew-symmetric matrix
+  - `vee`: Convert a skew-symmetric matrix to a 3D vector
   - `QuaternionToAngleAxis`: Convert a quaternion to an angle-axis
     representation
   - `AngleAxisToQuaternion`: Convert an angle-axis representation to a

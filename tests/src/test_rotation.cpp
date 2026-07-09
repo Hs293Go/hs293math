@@ -172,6 +172,34 @@ class RotationTest : public ::testing::Test {};
 using RealTypes = ::testing::Types<float, double, long double>;
 TYPED_TEST_SUITE(RotationTest, RealTypes);
 
+// --- hat / vee ---------------------------------------------------------------
+
+// The defining property hat(v) * u == v x u pins the entry placement and the
+// signs; the round-trip test below only shows vee reads back what hat wrote,
+// so together they anchor both maps to the cross product.
+TYPED_TEST(RotationTest, HatMatchesCrossProduct) {
+  using T = TypeParam;
+  std::mt19937 prng(2);
+  std::uniform_real_distribution<T> uniform(T(-5), T(5));
+  for (int i = 0; i < kNumTrials; ++i) {
+    const Eigen::Vector3<T> v(uniform(prng), uniform(prng), uniform(prng));
+    const Eigen::Vector3<T> u(uniform(prng), uniform(prng), uniform(prng));
+    ASSERT_LE((hs293go::hat(v) * u - v.cross(u)).norm(),
+              T(16) * Eps<T>() * v.norm() * u.norm());
+  }
+}
+
+TYPED_TEST(RotationTest, HatVeeInverses) {
+  using T = TypeParam;
+  std::mt19937 prng(3);
+  for (int i = 0; i < kNumTrials; ++i) {
+    const Eigen::Vector3<T> v = RandomUnitAxis<T>(prng);
+    const Eigen::Matrix3<T> skew = hs293go::hat(v);
+    // Hat and vee are just rearranging numbers, so they should be exact
+    ASSERT_EQ(hs293go::vee(skew), v);
+  }
+}
+
 // --- AngleAxis -> Quaternion -----------------------------------------------
 
 TYPED_TEST(RotationTest, ZeroAngleAxisToQuaternion) {
