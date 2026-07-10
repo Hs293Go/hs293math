@@ -28,6 +28,7 @@
 #include <numbers>
 
 #include "Eigen/Dense"
+#include "hs293go/eigen_utils.hpp"
 
 namespace hs293go {
 
@@ -83,7 +84,7 @@ Eigen::Matrix3<T> RotationMatrixZ(T angle) {
 
 // The hat (skew-symmetric) operator: hat(v) * u == v.cross(u). Maps a 3-vector
 // to the matrix generating the corresponding infinitesimal rotation.
-template <typename Derived>
+template <Vector3Like Derived>
 Eigen::Matrix3<typename Derived::Scalar> hat(
     const Eigen::MatrixBase<Derived>& v) {
   using Scalar = typename Derived::Scalar;
@@ -93,7 +94,7 @@ Eigen::Matrix3<typename Derived::Scalar> hat(
                                 {-v[1], v[0], Scalar(0)}};
 }
 
-template <typename Derived>
+template <Matrix3Like Derived>
 Eigen::Vector3<typename Derived::Scalar> vee(
     const Eigen::MatrixBase<Derived>& m) {
   using Scalar = typename Derived::Scalar;
@@ -138,7 +139,7 @@ Eigen::Vector3<typename Derived::Scalar> QuaternionToAngleAxis(
 
 // SO(3) exponential: a rotation vector (angle * axis) -> unit quaternion. The
 // inverse of QuaternionToAngleAxis.
-template <typename Derived>
+template <Vector3Like Derived>
 Eigen::Quaternion<typename Derived::Scalar> AngleAxisToQuaternion(
     const Eigen::MatrixBase<Derived>& angle_axis) {
   using Scalar = typename Derived::Scalar;
@@ -159,7 +160,7 @@ Eigen::Quaternion<typename Derived::Scalar> AngleAxisToQuaternion(
   return q;
 }
 
-template <typename Derived>
+template <Vector3Like Derived>
 Eigen::Matrix3<typename Derived::Scalar> AngleAxisToRotationMatrix(
     const Eigen::MatrixBase<Derived>& angle_axis) {
   using std::cos;
@@ -186,7 +187,7 @@ Eigen::Matrix3<typename Derived::Scalar> AngleAxisToRotationMatrix(
          sin_theta * hat(axis);
 }
 
-template <typename Derived>
+template <Matrix3Like Derived>
 Eigen::Vector3<typename Derived::Scalar> RotationMatrixToAngleAxis(
     const Eigen::MatrixBase<Derived>& rotation_matrix) {
   return QuaternionToAngleAxis(
