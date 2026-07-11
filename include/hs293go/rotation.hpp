@@ -145,6 +145,7 @@ Eigen::Quaternion<typename Derived::Scalar> AngleAxisToQuaternion(
   using Scalar = typename Derived::Scalar;
   using std::cos;
   using std::fpclassify;
+  using std::sin;
   const Scalar angle = angle_axis.norm();
   Eigen::Quaternion<Scalar> q;
   if (fpclassify(angle) == FP_ZERO) {
@@ -152,7 +153,7 @@ Eigen::Quaternion<typename Derived::Scalar> AngleAxisToQuaternion(
     q.vec() = angle_axis / Scalar(2);
   } else {
     const Scalar half_angle = angle / Scalar(2);
-    const Scalar sin_half = std::sin(half_angle);
+    const Scalar sin_half = sin(half_angle);
     q.w() = cos(half_angle);
     q.vec() = sin_half / angle * angle_axis;
   }
