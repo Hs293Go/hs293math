@@ -344,6 +344,170 @@ Eigen::Quaternion<typename Derived::Scalar> CanonicalizePositiveW(
   return Eigen::Quaternion<Scalar>(q);
 }
 
+namespace jacobians {
+
+template <typename QDerived, typename PDerived>
+Eigen::Matrix3<typename QDerived::Scalar> RotatedVectorByVector(
+    const Eigen::QuaternionBase<QDerived>& q,
+    const Eigen::MatrixBase<PDerived>& /*v*/) {
+  return q.toRotationMatrix();
+}
+
+template <typename QDerived, typename PDerived>
+Eigen::Matrix<typename QDerived::Scalar, 3, 4> RotatedVectorByQuaternion(
+    const Eigen::QuaternionBase<QDerived>& q,
+    const Eigen::MatrixBase<PDerived>& v) {
+  using Scalar = typename QDerived::Scalar;
+  const Eigen::Vector3<Scalar> tv = v + v;
+  const Eigen::Vector3<Scalar> u = q.vec().cross(tv) + q.w() * tv;
+  Eigen::Matrix<typename QDerived::Scalar, 3, 4> jac;
+  jac(ix::all, ix::seq3(0)) =
+      q.vec().dot(tv) * Eigen::Matrix3<Scalar>::Identity() - hat(u);
+  jac(ix::all, 3) = u;
+  return jac;
+}
+
+namespace details {
+template <typename PlusOrMinus, typename Derived>
+  requires(std::same_as<PlusOrMinus, std::plus<>> ||
+           std::same_as<PlusOrMinus, std::minus<>>)
+Eigen::Matrix3<typename Derived::Scalar> JacobianSO3(
+    const Eigen::MatrixBase<Derived>& angle_axis) {
+  using Scalar = typename Derived::Scalar;
+  using std::cos;
+  using std::fpclassify;
+  using std::sin;
+  const Scalar theta = angle_axis.stableNorm();
+  constexpr auto kPlusOrMinus = PlusOrMinus{};
+  if (fpclassify(theta) == FP_ZERO) {
+    return kPlusOrMinus(Eigen::Matrix3<Scalar>::Identity(),
+                        Scalar(0.5) * hat(angle_axis));
+  }
+  const Eigen::Vector3<Scalar> axis = angle_axis / theta;
+  const Scalar sinc_theta = sin(theta) / theta;
+  const Scalar cos_theta = cos(theta);
+  return kPlusOrMinus(sinc_theta * Eigen::Matrix3<Scalar>::Identity() +
+                          (Scalar(1) - sinc_theta) * axis * axis.transpose(),
+                      ((Scalar(1) - cos_theta) / theta) * hat(axis));
+}
+
+// Shared kernel for the inverse SO(3) Jacobians, mirroring JacobianSO3. The
+// coefficient (theta/2) cot(theta/2) is written with the half angle so it stays
+// well-conditioned all the way to theta = pi -- the full-angle (1 + cos)/sin
+// spelling is 0/0 there. PlusOrMinus selects the sign of the antisymmetric
+// term, and the pairing is *opposite* to JacobianSO3: inversion flips that
+// sign, so the right inverse takes std::plus and the left inverse std::minus.
+template <typename PlusOrMinus, typename Derived>
+  requires(std::same_as<PlusOrMinus, std::plus<>> ||
+           std::same_as<PlusOrMinus, std::minus<>>)
+Eigen::Matrix3<typename Derived::Scalar> JacobianSO3Inverse(
+    const Eigen::MatrixBase<Derived>& angle_axis) {
+  using Scalar = typename Derived::Scalar;
+  using std::cos;
+  using std::fpclassify;
+  using std::sin;
+  const Scalar theta = angle_axis.stableNorm();
+  constexpr auto kPlusOrMinus = PlusOrMinus{};
+  if (fpclassify(theta) == FP_ZERO) {
+    return kPlusOrMinus(Eigen::Matrix3<Scalar>::Identity(),
+                        Scalar(0.5) * hat(angle_axis));
+  }
+  const Eigen::Vector3<Scalar> axis = angle_axis / theta;
+  const Scalar half_theta = theta / Scalar(2);
+  const Scalar half_theta_cot = half_theta * cos(half_theta) / sin(half_theta);
+  return kPlusOrMinus(
+      half_theta_cot * Eigen::Matrix3<Scalar>::Identity() +
+          (Scalar(1) - half_theta_cot) * axis * axis.transpose(),
+      half_theta * hat(axis));
+}
+
+}  // namespace details
+
+template <typename Derived>
+Eigen::Matrix3<typename Derived::Scalar> LeftJacobianSO3(
+    const Eigen::MatrixBase<Derived>& angle_axis) {
+  return details::JacobianSO3<std::plus<>, Derived>(angle_axis);
+}
+
+template <typename Derived>
+Eigen::Matrix3<typename Derived::Scalar> RightJacobianSO3(
+    const Eigen::MatrixBase<Derived>& angle_axis) {
+  return details::JacobianSO3<std::minus<>, Derived>(angle_axis);
+}
+
+// Inverses of the left/right SO(3) Jacobians. These are the Jacobian of the
+// logarithm (a right perturbation of the group element maps to
+// LeftJacobianSO3Inverse/RightJacobianSO3Inverse times the change in Log) and
+// the building block of the boxminus/relative-rotation Jacobians. By
+// construction LeftJacobianSO3Inverse(v) * LeftJacobianSO3(v) == I, and
+// likewise on the right.
+template <typename Derived>
+Eigen::Matrix3<typename Derived::Scalar> LeftJacobianSO3Inverse(
+    const Eigen::MatrixBase<Derived>& angle_axis) {
+  return details::JacobianSO3Inverse<std::minus<>, Derived>(angle_axis);
+}
+
+template <typename Derived>
+Eigen::Matrix3<typename Derived::Scalar> RightJacobianSO3Inverse(
+    const Eigen::MatrixBase<Derived>& angle_axis) {
+  return details::JacobianSO3Inverse<std::plus<>, Derived>(angle_axis);
+}
+
+// The derivative of the rotated vector w.r.t. a perturbation of the
+// quaternion.
+//
+// The perturbation is expressed as a rotation vector and applied on the right,
+// i.e., the perturbed quaternion is q * exp([delta_theta, 0]), This is
+// applicable if the quaternion represents a body-to-world rotation, aka q_{ib}
+// and the perturbation is a small rotation of the movable body frame.
+//
+// # Example
+// Consider a drone translational dynamics model, which maps a body-frame
+// specific-thrust (i.e. divided by mass) vector to the world frame then
+// subtracts gravity to get the net acceleration:
+//
+// dot{v} = R(q_{ib}) * [0; 0; f_thrust] - [0; 0; g]
+//
+// The Jacobian of dot{v} w.r.t. a small rotation of the body frame is given by
+// RotatedVectorByRotationPerturbation(q_{ib}, [0; 0; f_thrust]).
+template <typename QDerived, typename PDerived>
+Eigen::Matrix3<typename QDerived::Scalar> RotatedVectorByRotationPerturbation(
+    const Eigen::QuaternionBase<QDerived>& q_ib,
+    const Eigen::MatrixBase<PDerived>& v) {
+  using Scalar = typename QDerived::Scalar;
+  return -q_ib.toRotationMatrix() * hat(v);
+}
+
+// The derivative of the inversely rotated vector w.r.t. a perturbation of the
+// quaternion.
+//
+// Like RotatedVectorByRotationPerturbation, this takes the body-to-world
+// rotation q_{ib} and perturbs it identically: the perturbation is a rotation
+// vector applied on the right, i.e. the perturbed quaternion is
+// q_{ib} * exp([delta_theta, 0]), a small rotation of the movable body frame.
+// The only difference is that this differentiates the *inversely* rotated
+// vector R(q_{ib})^-1 * v; the inverse is taken internally, so both functions
+// share the same argument and the same meaning of delta_theta.
+//
+// # Example
+// Consider a magnetometer measurement model, which maps magnetic field in the
+// world frame to the body frame (to be compared with the body-fixed
+// magnetometer reading):
+//
+// b' = R(q_{ib})^-1 * b
+//
+// The Jacobian of b' w.r.t. a small rotation of the body frame is given by
+// InverselyRotatedVectorByRotationPerturbation(q_{ib}, b).
+template <typename QDerived, typename PDerived>
+Eigen::Matrix3<typename QDerived::Scalar>
+InverselyRotatedVectorByRotationPerturbation(
+    const Eigen::QuaternionBase<QDerived>& q_ib,
+    const Eigen::MatrixBase<PDerived>& v) {
+  return hat(q_ib.conjugate() * v);
+}
+
+}  // namespace jacobians
+
 }  // namespace hs293go
 
 #endif  // HS293GO_ROTATION_HPP_

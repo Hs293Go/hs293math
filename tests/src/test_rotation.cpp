@@ -10,6 +10,7 @@
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "hs293go/rotation.hpp"
+#include "unsupported/Eigen/AutoDiff"
 
 using hs293go::AngleAxisToQuaternion;
 using hs293go::AngleAxisToRotationMatrix;
@@ -28,6 +29,15 @@ using hs293go::RotationMatrixX;
 using hs293go::RotationMatrixY;
 using hs293go::RotationMatrixZ;
 
+using hs293go::jacobians::InverselyRotatedVectorByRotationPerturbation;
+using hs293go::jacobians::LeftJacobianSO3;
+using hs293go::jacobians::LeftJacobianSO3Inverse;
+using hs293go::jacobians::RightJacobianSO3;
+using hs293go::jacobians::RightJacobianSO3Inverse;
+using hs293go::jacobians::RotatedVectorByQuaternion;
+using hs293go::jacobians::RotatedVectorByRotationPerturbation;
+using hs293go::jacobians::RotatedVectorByVector;
+
 // Teach gmock to print quaternions (Eigen has no operator<< for them, so they
 // would otherwise be dumped as raw bytes in failure messages).
 namespace Eigen {
@@ -35,6 +45,28 @@ template <typename T>
 void PrintTo(const Quaternion<T>& q, std::ostream* os) {
   *os << "Quaternion(w=" << q.w() << ", x=" << q.x() << ", y=" << q.y()
       << ", z=" << q.z() << ")";
+}
+
+// ADL shims that let the library's rotation conversions be differentiated by
+// AutoDiff. rotation.hpp calls fpclassify / copysign unqualified (after a
+// `using std::...`), so argument-dependent lookup finds these AutoDiffScalar
+// overloads -- AD scalars live in namespace Eigen -- and Exp/Log become
+// differentiable with no change to the library. fpclassify reads only the
+// value; copysign carries the sign onto the derivative (its dependence on
+// `sgn` is zero almost everywhere).
+template <typename DerType>
+int fpclassify(const AutoDiffScalar<DerType>& x) {
+  return std::fpclassify(x.value());
+}
+
+template <typename DerType>
+AutoDiffScalar<DerType> copysign(const AutoDiffScalar<DerType>& mag,
+                                 const AutoDiffScalar<DerType>& sgn) {
+  using Scalar = typename DerType::Scalar;
+  const Scalar sign = std::copysign(Scalar(1), mag.value()) *
+                      std::copysign(Scalar(1), sgn.value());
+  return AutoDiffScalar<DerType>(std::copysign(mag.value(), sgn.value()),
+                                 sign * mag.derivatives());
 }
 }  // namespace Eigen
 
@@ -739,4 +771,364 @@ TYPED_TEST(RotationTest, PrincipalRotationKnownValues) {
   EXPECT_THAT(RotationMatrixZ(h), IsNear3x3Matrix(rz, 16));
   // The kernel called with the named axis equals the wrapper.
   EXPECT_THAT(PrincipalRotationMatrix<Axis::kZ>(h), IsNear3x3Matrix(rz, 16));
+}
+
+// --- jacobians ---------------------------------------------------------------
+//
+// Two complementary strategies. The typed tests below assert exact analytic
+// identities (a Jacobian's own algebra: homogeneity, transpose/adjoint,
+// axis-annihilation) that hold to machine precision for every scalar type and
+// need no differentiation. The double-only AutoDiff tests further down pin each
+// Jacobian to the *convention* it documents by differentiating the very
+// operation it linearizes -- that is what catches a right-vs-left mix-up or a
+// missing factor that an internally-consistent-but-wrong formula would pass.
+
+// d(R(q) v)/dv is the rotation matrix itself: orthonormal, and applying it to v
+// reproduces the rotated vector (rotation is linear in v).
+TYPED_TEST(RotationTest, RotatedVectorByVectorIsRotation) {
+  using T = TypeParam;
+  std::mt19937 prng(1201);
+  std::uniform_real_distribution<T> uniform(T(-5), T(5));
+  for (int i = 0; i < kNumTrials; ++i) {
+    const Eigen::Quaternion<T> q = RandomUnitQuaternion<T>(prng);
+    const Eigen::Vector3<T> v(uniform(prng), uniform(prng), uniform(prng));
+    const Eigen::Matrix3<T> jac = RotatedVectorByVector(q, v);
+    ASSERT_THAT(jac, IsOrthonormal());
+    ASSERT_LE((jac * v - q * v).norm(), T(64) * Eps<T>() * v.norm());
+  }
+}
+
+// The 3x4 Jacobian of the (unnormalized) sandwich map q (x) [0,v] (x) q* is
+// degree-2 homogeneous in q, so Euler's theorem pins J*q == 2*(q*v) at unit q.
+// A missing factor of 2 on the skew term (the historical bug) breaks this.
+TYPED_TEST(RotationTest, RotatedVectorByQuaternionEulerHomogeneity) {
+  using T = TypeParam;
+  std::mt19937 prng(1213);
+  std::uniform_real_distribution<T> uniform(T(-5), T(5));
+  for (int i = 0; i < kNumTrials; ++i) {
+    const Eigen::Quaternion<T> q = RandomUnitQuaternion<T>(prng);
+    const Eigen::Vector3<T> v(uniform(prng), uniform(prng), uniform(prng));
+    const Eigen::Matrix<T, 3, 4> jac = RotatedVectorByQuaternion(q, v);
+    ASSERT_LE((jac * q.coeffs() - T(2) * (q * v)).norm(),
+              T(256) * Eps<T>() * (T(1) + v.norm()));
+  }
+}
+
+// Right and left Jacobians are transposes; the left is the right conjugated by
+// the rotation (adjoint identity Jl = R Jr); and Jr(theta) = Jl(-theta). These
+// three algebraic ties fail if either is computed with the wrong skew sign.
+TYPED_TEST(RotationTest, LeftRightJacobianSO3Relationships) {
+  using T = TypeParam;
+  std::mt19937 prng(1217);
+  for (int i = 0; i < kNumTrials; ++i) {
+    const Eigen::Vector3<T> axis = RandomUnitAxis<T>(prng);
+    const T theta = RandomInRange<T>(prng, -kPi<T>, kPi<T>);
+    const Eigen::Vector3<T> aa = axis * theta;
+    const Eigen::Matrix3<T> jl = LeftJacobianSO3(aa);
+    const Eigen::Matrix3<T> jr = RightJacobianSO3(aa);
+    ASSERT_THAT(jr, IsNear3x3Matrix(Eigen::Matrix3<T>(jl.transpose()), 64));
+    ASSERT_THAT(
+        jl, IsNear3x3Matrix(
+                Eigen::Matrix3<T>(AngleAxisToRotationMatrix(aa) * jr), 256));
+    ASSERT_THAT(RightJacobianSO3(aa),
+                IsNear3x3Matrix(LeftJacobianSO3(Eigen::Vector3<T>(-aa)), 64));
+  }
+}
+
+// At zero rotation both Jacobians are the identity (the FP_ZERO branch returns
+// I -/+ 0 exactly).
+TYPED_TEST(RotationTest, JacobianSO3AtZeroIsIdentity) {
+  using T = TypeParam;
+  const Eigen::Vector3<T> zero = Eigen::Vector3<T>::Zero();
+  EXPECT_THAT(LeftJacobianSO3(zero),
+              IsNear3x3Matrix(Eigen::Matrix3<T>::Identity(), 16));
+  EXPECT_THAT(RightJacobianSO3(zero),
+              IsNear3x3Matrix(Eigen::Matrix3<T>::Identity(), 16));
+}
+
+// The defining property of the inverse Jacobians: J^-1 J == I on both sides.
+// The angle is kept above a small floor: like the forward kernel, these closed
+// forms special-case only theta == 0 exactly, so as theta -> 0 the 1 - sinc and
+// 1 - (theta/2)cot(theta/2) terms lose relative precision (both matrices are
+// ~= I there regardless). That near-zero regime is covered by the zero-identity
+// test and the AutoDiff test below; here we exercise the well-conditioned
+// range.
+TYPED_TEST(RotationTest, LeftRightJacobianSO3InverseAreInverses) {
+  using T = TypeParam;
+  std::mt19937 prng(1229);
+  for (int i = 0; i < kNumTrials; ++i) {
+    const Eigen::Vector3<T> aa =
+        RandomUnitAxis<T>(prng) * RandomInRange<T>(prng, T(0.05), kPi<T>);
+    ASSERT_THAT(
+        Eigen::Matrix3<T>(LeftJacobianSO3Inverse(aa) * LeftJacobianSO3(aa)),
+        IsNear3x3Matrix(Eigen::Matrix3<T>::Identity(), 256));
+    ASSERT_THAT(
+        Eigen::Matrix3<T>(RightJacobianSO3Inverse(aa) * RightJacobianSO3(aa)),
+        IsNear3x3Matrix(Eigen::Matrix3<T>::Identity(), 256));
+  }
+}
+
+// Same structural ties as the forward pair: the right and left inverses are
+// transposes, and the left inverse at -theta is the right inverse at theta.
+TYPED_TEST(RotationTest, LeftRightJacobianSO3InverseRelationships) {
+  using T = TypeParam;
+  std::mt19937 prng(1231);
+  for (int i = 0; i < kNumTrials; ++i) {
+    const Eigen::Vector3<T> aa =
+        RandomUnitAxis<T>(prng) * RandomInRange<T>(prng, -kPi<T>, kPi<T>);
+    ASSERT_THAT(
+        RightJacobianSO3Inverse(aa),
+        IsNear3x3Matrix(
+            Eigen::Matrix3<T>(LeftJacobianSO3Inverse(aa).transpose()), 64));
+    ASSERT_THAT(
+        RightJacobianSO3Inverse(aa),
+        IsNear3x3Matrix(LeftJacobianSO3Inverse(Eigen::Vector3<T>(-aa)), 64));
+  }
+}
+
+// At zero rotation both inverse Jacobians are the identity.
+TYPED_TEST(RotationTest, JacobianSO3InverseAtZeroIsIdentity) {
+  using T = TypeParam;
+  const Eigen::Vector3<T> zero = Eigen::Vector3<T>::Zero();
+  EXPECT_THAT(LeftJacobianSO3Inverse(zero),
+              IsNear3x3Matrix(Eigen::Matrix3<T>::Identity(), 16));
+  EXPECT_THAT(RightJacobianSO3Inverse(zero),
+              IsNear3x3Matrix(Eigen::Matrix3<T>::Identity(), 16));
+}
+
+// A body-frame perturbation about an axis aligned with the rotated vector
+// leaves the result unchanged to first order, so each perturbation Jacobian
+// annihilates the vector it acts on: (-R hat(v)) v == 0 for the forward map and
+// hat(R^-1 v) (R^-1 v) == 0 for the inverse map.
+TYPED_TEST(RotationTest, RotationPerturbationJacobiansAnnihilateAxis) {
+  using T = TypeParam;
+  std::mt19937 prng(1223);
+  std::uniform_real_distribution<T> uniform(T(-5), T(5));
+  for (int i = 0; i < kNumTrials; ++i) {
+    const Eigen::Quaternion<T> q = RandomUnitQuaternion<T>(prng);
+    const Eigen::Vector3<T> v(uniform(prng), uniform(prng), uniform(prng));
+    ASSERT_LE((RotatedVectorByRotationPerturbation(q, v) * v).norm(),
+              T(64) * Eps<T>() * v.squaredNorm());
+    const Eigen::Vector3<T> inv_rotated = q.conjugate() * v;
+    ASSERT_LE((InverselyRotatedVectorByRotationPerturbation(q, v) * inv_rotated)
+                  .norm(),
+              T(64) * Eps<T>() * v.squaredNorm());
+  }
+}
+
+// --- jacobians: autodiff convention checks (double precision) ----------------
+//
+// These pin each Jacobian to the *convention* it documents by forward-mode
+// automatic differentiation (Eigen's unsupported AutoDiff module) of the exact
+// operation it linearizes -- and, for the rotation-valued ones, of the
+// library's own Exp/Log (AngleAxisToQuaternion, AngleAxisToRotationMatrix,
+// QuaternionToAngleAxis) reached through the fpclassify/copysign ADL shims
+// above, so the test differentiates the real conversion, not a stand-in. A
+// right/left mix-up, a wrong perturbation frame, or a missing factor is caught
+// even when the closed form is internally consistent. AutoDiff carries no
+// truncation error, so the tolerances sit near machine epsilon rather than the
+// ~1e-6 floor of finite differencing.
+
+namespace {
+
+// Forward-mode scalars carrying 3 or 4 partial derivatives.
+using AD3 = Eigen::AutoDiffScalar<Eigen::Vector3d>;
+using AD4 = Eigen::AutoDiffScalar<Eigen::Vector4d>;
+
+constexpr double kAdTol = 1e-12;
+constexpr int kAdTrials = 200;
+
+// Three independent AD variables seeded from x (identity Jacobian).
+Eigen::Vector3<AD3> Variable3(const Eigen::Vector3d& x) {
+  return Eigen::Vector3<AD3>::NullaryExpr(
+      [&](int i) { return AD3{x[i], Eigen::Vector3d::Unit(i)}; });
+}
+
+// A constant AD quaternion (all partials zero).
+template <typename AD>
+Eigen::Quaternion<AD> ConstantQuaternion(const Eigen::Quaterniond& q) {
+  return Eigen::Quaternion<AD>(AD(q.w()), AD(q.x()), AD(q.y()), AD(q.z()));
+}
+
+// The right retraction q * Exp(delta), built on the library exponential so the
+// test differentiates the real conversion. `delta` seeds the AD variables; at
+// delta = 0 AngleAxisToQuaternion's exact-zero branch returns (1, delta / 2),
+// whose derivative is the generator (0, I / 2) -- i.e. a valid retraction with
+// no separate helper and no 0/0.
+Eigen::Quaternion<AD3> RightRetraction(const Eigen::Quaterniond& q,
+                                       const Eigen::Vector3d& delta) {
+  return ConstantQuaternion<AD3>(q) * AngleAxisToQuaternion(Variable3(delta));
+}
+
+}  // namespace
+
+// d(R(q) v)/dv, differentiating the rotation of v with respect to v.
+TEST(JacobianAutoDiffTest, RotatedVectorByVector) {
+  std::mt19937 prng(1301);
+  for (int i = 0; i < kAdTrials; ++i) {
+    const Eigen::Quaterniond q = RandomUnitQuaternion<double>(prng);
+    const Eigen::Vector3d v =
+        RandomUnitAxis<double>(prng) * RandomInRange<double>(prng, 0.1, 5.0);
+    const Eigen::Vector3<AD3> rotated =
+        ConstantQuaternion<AD3>(q) * Variable3(v);
+    Eigen::Matrix3d autodiff;
+    for (int r = 0; r < 3; ++r) {
+      autodiff.row(r) = rotated[r].derivatives().transpose();
+    }
+    ASSERT_LE((RotatedVectorByVector(q, v) - autodiff).norm(),
+              kAdTol * (1 + v.norm()));
+  }
+}
+
+// d(sandwich)/d q.coeffs(): differentiate q (x) [0,v] (x) q* with respect to
+// the four raw coefficients [x, y, z, w].
+TEST(JacobianAutoDiffTest, RotatedVectorByQuaternion) {
+  std::mt19937 prng(1303);
+  for (int i = 0; i < kAdTrials; ++i) {
+    const Eigen::Quaterniond q = RandomUnitQuaternion<double>(prng);
+    const Eigen::Vector3d v =
+        RandomUnitAxis<double>(prng) * RandomInRange<double>(prng, 0.1, 5.0);
+    Eigen::Quaternion<AD4> q_ad;
+    for (int c = 0; c < 4; ++c) {
+      q_ad.coeffs()[c].value() = q.coeffs()[c];
+      q_ad.coeffs()[c].derivatives() = Eigen::Vector4d::Unit(c);
+    }
+    const Eigen::Quaternion<AD4> pure(AD4(0.0), AD4(v.x()), AD4(v.y()),
+                                      AD4(v.z()));
+    const Eigen::Vector3<AD4> rotated = (q_ad * pure * q_ad.conjugate()).vec();
+    Eigen::Matrix<double, 3, 4> autodiff;
+    for (int r = 0; r < 3; ++r) {
+      autodiff.row(r) = rotated[r].derivatives().transpose();
+    }
+    ASSERT_LE((RotatedVectorByQuaternion(q, v) - autodiff).norm(),
+              kAdTol * (1 + v.norm()));
+  }
+}
+
+// Convention: the body-to-world q_ib is perturbed on the right, q_ib * Exp(d);
+// differentiate R(q_ib Exp(d)) v at d = 0.
+TEST(JacobianAutoDiffTest, RotatedVectorByRotationPerturbation) {
+  std::mt19937 prng(1307);
+  for (int i = 0; i < kAdTrials; ++i) {
+    const Eigen::Quaterniond q = RandomUnitQuaternion<double>(prng);
+    const Eigen::Vector3d v =
+        RandomUnitAxis<double>(prng) * RandomInRange<double>(prng, 0.1, 5.0);
+    const Eigen::Vector3<AD3> point(AD3(v.x()), AD3(v.y()), AD3(v.z()));
+    const Eigen::Vector3<AD3> rotated =
+        RightRetraction(q, Eigen::Vector3d::Zero()) * point;
+    Eigen::Matrix3d autodiff;
+    for (int r = 0; r < 3; ++r) {
+      autodiff.row(r) = rotated[r].derivatives().transpose();
+    }
+    ASSERT_LE((RotatedVectorByRotationPerturbation(q, v) - autodiff).norm(),
+              kAdTol * (1 + v.norm()));
+  }
+}
+
+// Convention: the same right perturbation of the same body-to-world q_ib, but
+// differentiating the inversely rotated R(q_ib Exp(d))^-1 v at d = 0 -- the
+// flipped API takes q_ib and inverts internally.
+TEST(JacobianAutoDiffTest, InverselyRotatedVectorByRotationPerturbation) {
+  std::mt19937 prng(1311);
+  for (int i = 0; i < kAdTrials; ++i) {
+    const Eigen::Quaterniond q = RandomUnitQuaternion<double>(prng);
+    const Eigen::Vector3d v =
+        RandomUnitAxis<double>(prng) * RandomInRange<double>(prng, 0.1, 5.0);
+    const Eigen::Vector3<AD3> point(AD3(v.x()), AD3(v.y()), AD3(v.z()));
+    const Eigen::Vector3<AD3> rotated =
+        RightRetraction(q, Eigen::Vector3d::Zero()).conjugate() * point;
+    Eigen::Matrix3d autodiff;
+    for (int r = 0; r < 3; ++r) {
+      autodiff.row(r) = rotated[r].derivatives().transpose();
+    }
+    ASSERT_LE(
+        (InverselyRotatedVectorByRotationPerturbation(q, v) - autodiff).norm(),
+        kAdTol * (1 + v.norm()));
+  }
+}
+
+// The right and left Jacobians are the right/left derivatives of the
+// exponential map: with R(theta) = Exp(theta), dR/dtheta_i = R [Jr e_i]x =
+// [Jl e_i]x R, so column i of Jr is vee(R^T dR_i) and of Jl is vee(dR_i R^T).
+// Differentiating the library's own AngleAxisToRotationMatrix by AutoDiff ties
+// both to the exponential map with no closed form.
+TEST(JacobianAutoDiffTest, LeftAndRightJacobianSO3) {
+  std::mt19937 prng(1313);
+  for (int i = 0; i < kAdTrials; ++i) {
+    // theta != 0: the exponential's norm is not differentiable at the origin.
+    const Eigen::Vector3d aa =
+        RandomUnitAxis<double>(prng) * RandomInRange<double>(prng, 0.05, 3.0);
+    const Eigen::Matrix<AD3, 3, 3> rotation =
+        AngleAxisToRotationMatrix(Variable3(aa));
+    Eigen::Matrix3d r_value = Eigen::Matrix3d::NullaryExpr(
+        [&](int i, int j) { return rotation(i, j).value(); });
+
+    Eigen::Matrix3d jr;
+    Eigen::Matrix3d jl;
+    for (int c = 0; c < 3; ++c) {
+      Eigen::Matrix3d d_rotation;
+      for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) {
+          d_rotation(a, b) = rotation(a, b).derivatives()[c];
+        }
+      }
+      jr.col(c) =
+          hs293go::vee(Eigen::Matrix3d(r_value.transpose() * d_rotation));
+      jl.col(c) =
+          hs293go::vee(Eigen::Matrix3d(d_rotation * r_value.transpose()));
+    }
+    ASSERT_LE((RightJacobianSO3(aa) - jr).norm(), kAdTol);
+    ASSERT_LE((LeftJacobianSO3(aa) - jl).norm(), kAdTol);
+  }
+}
+
+// Exp and Log are inverse maps, so d Log(Exp(theta))/dtheta = I.
+// Differentiating the round trip through the library's own
+// AngleAxisToQuaternion and QuaternionToAngleAxis exercises the copysign path
+// inside the logarithm.
+TEST(JacobianAutoDiffTest, ExpLogRoundTripJacobianIsIdentity) {
+  std::mt19937 prng(1319);
+  for (int i = 0; i < kAdTrials; ++i) {
+    // Away from 0 and pi, where Log's axis and branch are well defined.
+    const Eigen::Vector3d aa =
+        RandomUnitAxis<double>(prng) * RandomInRange<double>(prng, 0.05, 3.0);
+    const Eigen::Vector3<AD3> recovered =
+        QuaternionToAngleAxis(AngleAxisToQuaternion(Variable3(aa)));
+    Eigen::Matrix3d autodiff;
+    for (int r = 0; r < 3; ++r) {
+      autodiff.row(r) = recovered[r].derivatives().transpose();
+    }
+    ASSERT_LE((autodiff - Eigen::Matrix3d::Identity()).norm(), kAdTol);
+  }
+}
+
+// The inverse Jacobians are the derivatives of the logarithm under a right/left
+// perturbation: Jr^-1(theta) = d Log(Exp(theta) Exp(delta))/ddelta and
+// Jl^-1(theta) = d Log(Exp(delta) Exp(theta))/ddelta, both at delta = 0. This
+// differentiates the library's own AngleAxisToQuaternion/QuaternionToAngleAxis
+// and confirms the closed forms match that definition.
+TEST(JacobianAutoDiffTest, LeftAndRightJacobianSO3Inverse) {
+  std::mt19937 prng(1321);
+  for (int i = 0; i < kAdTrials; ++i) {
+    // Away from 0 and pi, where Log's axis and branch are well defined.
+    const Eigen::Vector3d aa =
+        RandomUnitAxis<double>(prng) * RandomInRange<double>(prng, 0.05, 3.0);
+    const Eigen::Quaternion<AD3> exp_theta =
+        ConstantQuaternion<AD3>(AngleAxisToQuaternion(aa));
+    const Eigen::Quaternion<AD3> exp_delta =
+        AngleAxisToQuaternion(Variable3(Eigen::Vector3d::Zero()));
+
+    const Eigen::Vector3<AD3> right_log =
+        QuaternionToAngleAxis(exp_theta * exp_delta);
+    const Eigen::Vector3<AD3> left_log =
+        QuaternionToAngleAxis(exp_delta * exp_theta);
+    Eigen::Matrix3d jr_inv;
+    Eigen::Matrix3d jl_inv;
+    for (int r = 0; r < 3; ++r) {
+      jr_inv.row(r) = right_log[r].derivatives().transpose();
+      jl_inv.row(r) = left_log[r].derivatives().transpose();
+    }
+    ASSERT_LE((RightJacobianSO3Inverse(aa) - jr_inv).norm(), kAdTol);
+    ASSERT_LE((LeftJacobianSO3Inverse(aa) - jl_inv).norm(), kAdTol);
+  }
 }
