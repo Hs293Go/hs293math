@@ -5,6 +5,12 @@ FetchContent_Declare(
       SYSTEM)
 FetchContent_MakeAvailable(GTest)
 
+# Keep vendored gtest TUs out of compile_commands.json; clangd infers header
+# flags from the nearest database entry, and a gtest entry lacks this project's
+# include paths.
+set_target_properties(gtest gtest_main gmock gmock_main
+                      PROPERTIES EXPORT_COMPILE_COMMANDS OFF)
+
 include(GoogleTest)
 
 function(hs293go_add_test test_name)
