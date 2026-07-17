@@ -12,6 +12,7 @@
 #include "hs293go/rotation.hpp"
 #include "unsupported/Eigen/AutoDiff"
 
+using hs293go::AngleAxisRotateVector;
 using hs293go::AngleAxisToQuaternion;
 using hs293go::AngleAxisToRotationMatrix;
 using hs293go::Axis;
@@ -531,6 +532,101 @@ TYPED_TEST(RotationTest, AngleAxisToRotationMatrixAndBackNearZero) {
     const Eigen::Vector3<T> round_trip = RotationMatrixToAngleAxis(R);
     // Absolute comparison: the magnitude itself is ~machine-eps scale.
     ASSERT_LE((round_trip - aa).norm(), T(64) * Eps<T>());
+  }
+}
+
+// --- AngleAxisRotateVector
+// ----------------------------------------------------
+
+// Zero rotation is the identity map, exactly (the FP_ZERO branch adds 0 x v).
+TYPED_TEST(RotationTest, ZeroAngleAxisRotateVector) {
+  using T = TypeParam;
+  const Eigen::Vector3<T> p(T(1), T(-2), T(3));
+  EXPECT_EQ(AngleAxisRotateVector(Eigen::Vector3<T>::Zero(), p), p);
+}
+
+// Active right-handed convention pinned by the cyclic quarter turns:
+// Rz(pi/2) x = y, Rx(pi/2) y = z, Ry(pi/2) z = x.
+TYPED_TEST(RotationTest, AngleAxisRotateVectorKnownValues) {
+  using T = TypeParam;
+  const T h = kPi<T> / 2;
+  const T tol = T(16) * Eps<T>();
+  EXPECT_LE((AngleAxisRotateVector(Eigen::Vector3<T>(T(0), T(0), h),
+                                   Eigen::Vector3<T>::UnitX()) -
+             Eigen::Vector3<T>::UnitY())
+                .norm(),
+            tol);
+  EXPECT_LE((AngleAxisRotateVector(Eigen::Vector3<T>(h, T(0), T(0)),
+                                   Eigen::Vector3<T>::UnitY()) -
+             Eigen::Vector3<T>::UnitZ())
+                .norm(),
+            tol);
+  EXPECT_LE((AngleAxisRotateVector(Eigen::Vector3<T>(T(0), h, T(0)),
+                                   Eigen::Vector3<T>::UnitZ()) -
+             Eigen::Vector3<T>::UnitX())
+                .norm(),
+            tol);
+}
+
+// Internal consistency: rotating the vector directly agrees with building the
+// rotation matrix and multiplying.
+TYPED_TEST(RotationTest, AngleAxisRotateVectorMatchesRotationMatrix) {
+  using T = TypeParam;
+  std::mt19937 prng(67);
+  std::uniform_real_distribution<T> uniform(T(-5), T(5));
+  for (int i = 0; i < kNumTrials; ++i) {
+    const Eigen::Vector3<T> axis = RandomUnitAxis<T>(prng);
+    const T theta = RandomInRange<T>(prng, -kPi<T>, kPi<T>);
+    const Eigen::Vector3<T> aa = axis * theta;
+    const Eigen::Vector3<T> p(uniform(prng), uniform(prng), uniform(prng));
+    ASSERT_LE((AngleAxisRotateVector(aa, p) - AngleAxisToRotationMatrix(aa) * p)
+                  .norm(),
+              T(64) * Eps<T>() * p.norm());
+  }
+}
+
+// Independent oracle: Eigen's own AngleAxis rotation. Angles beyond +/-pi are
+// included -- Rodrigues's formula is periodic and must not assume a wrapped
+// input.
+TYPED_TEST(RotationTest, AngleAxisRotateVectorMatchesEigen) {
+  using T = TypeParam;
+  std::mt19937 prng(71);
+  std::uniform_real_distribution<T> uniform(T(-5), T(5));
+  for (int i = 0; i < kNumTrials; ++i) {
+    const Eigen::Vector3<T> axis = RandomUnitAxis<T>(prng);
+    const T theta = RandomInRange<T>(prng, -T(3) * kPi<T>, T(3) * kPi<T>);
+    const Eigen::Vector3<T> p(uniform(prng), uniform(prng), uniform(prng));
+    const Eigen::Vector3<T> ours =
+        AngleAxisRotateVector(Eigen::Vector3<T>(axis * theta), p);
+    const Eigen::Vector3<T> oracle =
+        Eigen::AngleAxis<T>(theta, axis).toRotationMatrix() * p;
+    ASSERT_LE((ours - oracle).norm(), T(128) * Eps<T>() * p.norm());
+  }
+}
+
+// theta^2 (~1.4e-47) underflows to 0 in float here; the unit-axis form must
+// stay finite and return v + aa x v -- identity to machine precision -- not
+// 0/0.
+TYPED_TEST(RotationTest, NearZeroAngleAxisRotateVector) {
+  using T = TypeParam;
+  const Eigen::Vector3<T> aa(static_cast<T>(1e-24), static_cast<T>(2e-24),
+                             static_cast<T>(3e-24));
+  const Eigen::Vector3<T> p(T(1), T(-2), T(3));
+  const Eigen::Vector3<T> rotated = AngleAxisRotateVector(aa, p);
+  EXPECT_LE((rotated - p).norm(), T(16) * Eps<T>() * p.norm());
+}
+
+// A vector along the rotation axis is a fixed point for any angle.
+TYPED_TEST(RotationTest, AngleAxisRotateVectorAlongAxisIsFixed) {
+  using T = TypeParam;
+  std::mt19937 prng(73);
+  for (int i = 0; i < kNumTrials; ++i) {
+    const Eigen::Vector3<T> axis = RandomUnitAxis<T>(prng);
+    const T theta = RandomInRange<T>(prng, -kPi<T>, kPi<T>);
+    const Eigen::Vector3<T> p = RandomInRange<T>(prng, T(0.5), T(5)) * axis;
+    ASSERT_LE(
+        (AngleAxisRotateVector(Eigen::Vector3<T>(axis * theta), p) - p).norm(),
+        T(64) * Eps<T>() * p.norm());
   }
 }
 
@@ -1130,5 +1226,33 @@ TEST(JacobianAutoDiffTest, LeftAndRightJacobianSO3Inverse) {
     }
     ASSERT_LE((RightJacobianSO3Inverse(aa) - jr_inv).norm(), kAdTol);
     ASSERT_LE((LeftJacobianSO3Inverse(aa) - jl_inv).norm(), kAdTol);
+  }
+}
+
+// AngleAxisRotateVector is the exponential map composed with the rotation
+// action, so by the chain rule d(R(Exp(aa)) v)/daa = -R(aa) hat(v) Jr(aa); at
+// aa = 0 this reduces to -hat(v) -- exactly the derivative the FP_ZERO
+// branch's first-order form v + aa x v preserves (a bare `return v` would
+// report zero).
+TEST(JacobianAutoDiffTest, AngleAxisRotateVectorByAngleAxis) {
+  std::mt19937 prng(1327);
+  for (int i = 0; i < kAdTrials; ++i) {
+    // The first trial sits exactly at aa = 0 to exercise the FP_ZERO branch.
+    const Eigen::Vector3d aa =
+        i == 0 ? Eigen::Vector3d::Zero()
+               : Eigen::Vector3d(RandomUnitAxis<double>(prng) *
+                                 RandomInRange<double>(prng, 0.05, 3.0));
+    const Eigen::Vector3d v =
+        RandomUnitAxis<double>(prng) * RandomInRange<double>(prng, 0.1, 5.0);
+    const Eigen::Vector3<AD3> point(AD3(v.x()), AD3(v.y()), AD3(v.z()));
+    const Eigen::Vector3<AD3> rotated =
+        AngleAxisRotateVector(Variable3(aa), point);
+    Eigen::Matrix3d autodiff;
+    for (int r = 0; r < 3; ++r) {
+      autodiff.row(r) = rotated[r].derivatives().transpose();
+    }
+    const Eigen::Matrix3d expected =
+        -AngleAxisToRotationMatrix(aa) * hs293go::hat(v) * RightJacobianSO3(aa);
+    ASSERT_LE((expected - autodiff).norm(), kAdTol * (1 + v.norm()));
   }
 }

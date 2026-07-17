@@ -195,6 +195,30 @@ Eigen::Vector3<typename Derived::Scalar> RotationMatrixToAngleAxis(
       Eigen::Quaternion<typename Derived::Scalar>(rotation_matrix));
 }
 
+// Rotate `v` by the rotation vector `angle_axis` (angle * unit axis) without
+// forming the intermediate matrix: Rodrigues's formula applied directly.
+// Equivalent to AngleAxisToRotationMatrix(angle_axis) * v; this is Ceres's
+// AngleAxisRotatePoint.
+template <Vector3Like ADerived, Vector3Like VDerived>
+Eigen::Vector3<typename ADerived::Scalar> AngleAxisRotateVector(
+    const Eigen::MatrixBase<ADerived>& angle_axis,
+    const Eigen::MatrixBase<VDerived>& v) {
+  using Scalar = typename ADerived::Scalar;
+  using std::cos;
+  using std::fpclassify;
+  using std::sin;
+  const Scalar theta = angle_axis.stableNorm();
+  if (fpclassify(theta) == FP_ZERO) {
+    return v + angle_axis.cross(v);
+  }
+  const Scalar cos_theta = cos(theta);
+  const Scalar sin_theta = sin(theta);
+
+  const Eigen::Vector3<Scalar> axis = angle_axis / theta;
+  return cos_theta * v + (Scalar(1) - cos_theta) * axis.dot(v) * axis +
+         sin_theta * axis.cross(v);
+}
+
 template <std::floating_point T>
 struct EulerAngles {
   T roll = T(0);   // rotation about x-axis
