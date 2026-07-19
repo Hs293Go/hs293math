@@ -22,6 +22,8 @@
 #ifndef HS293GO_EIGEN_UTILS_HPP_
 #define HS293GO_EIGEN_UTILS_HPP_
 
+#include <concepts>
+
 #include "Eigen/Dense"
 
 namespace hs293go {
@@ -48,7 +50,7 @@ inline auto seq6(Eigen::Index start = 0) { return seqFixed<6>(start); }
 template <typename Derived>
 concept VectorLike = requires {
   { Derived::IsVectorAtCompileTime } -> std::convertible_to<bool>;
-} && bool(Derived::ColsAtCompileTime);
+} && bool(Derived::IsVectorAtCompileTime);
 
 template <typename Derived, int S>
 concept FixedSizeVectorLike = requires {
