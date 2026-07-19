@@ -20,6 +20,11 @@ function(hs293go_add_test test_name)
   gtest_discover_tests(${test_name})
 endfunction()
 
+# Not a test: regenerates tests/golden/rotation_goldens.safetensors, the
+# committed parity contract downstream ports verify against.
+add_executable(gen_rotation_goldens src/gen_rotation_goldens.cpp)
+target_link_libraries(gen_rotation_goldens PRIVATE hs293go::math)
+
 hs293go_add_test(test_math src/test_math.cpp)
 hs293go_add_test(test_frame_conversions src/test_frame_conversions.cpp)
 hs293go_add_test(test_rotation src/test_rotation.cpp)
