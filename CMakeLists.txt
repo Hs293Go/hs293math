@@ -20,7 +20,8 @@ target_sources(
             include/hs293go/frame_conversions.hpp
             include/hs293go/rigid_transform.hpp
             include/hs293go/eigen_utils.hpp
-            include/hs293go/geo.hpp)
+            include/hs293go/geo.hpp
+            include/hs293go/nn.hpp)
 target_compile_features(hs293go_math INTERFACE cxx_std_20)
 target_link_libraries(hs293go_math INTERFACE Eigen3::Eigen)
 set_target_properties(hs293go_math PROPERTIES EXPORT_NAME math)
